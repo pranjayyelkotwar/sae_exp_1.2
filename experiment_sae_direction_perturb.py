@@ -37,6 +37,24 @@ class PerturbationResult:
     output_changed: bool
 
 
+@dataclass
+class TokenPerturbationSummary:
+    sample_idx: int
+    activation_path: str
+    token_pos: int
+    seq_len: int
+    prompt_len: int
+    top_latents: list[int]
+    grounding_original: float
+    avg_grounding_new: float
+    avg_grounding_delta: float
+    max_grounding_delta: float
+    min_grounding_delta: float
+    total_trials: int
+    output_changed_count: int
+    output_changed_ratio: float
+
+
 def parse_activation_indices(raw: str) -> list[int]:
     if not raw:
         return []
@@ -354,8 +372,6 @@ def main() -> None:
             raise ValueError(f"Expected activations shape (seq_len, d_model), got {tuple(activations.shape)}")
 
         seq_len, d_model = activations.shape
-        token_pos = choose_token_pos(args.token_pos, seq_len)
-
         prompt_text = None
         if args.use_metadata_prompt:
             prompt_text = prompt_map.get(sample_idx)
@@ -384,16 +400,6 @@ def main() -> None:
             prompt_tokens = prompt_tokens[:min_len]
             activations = activations[:min_len]
             seq_len = min_len
-            token_pos = choose_token_pos(token_pos, seq_len)
-
-        h_token = activations[token_pos].to(device=device, dtype=sae_dtype).unsqueeze(0)
-
-        with torch.no_grad():
-            h_dense, h_sparse = encode_with_sae(sae, h_token)
-            grounding_original = g_sae(h_sparse, c_vector).item()
-
-        top_values, top_indices = torch.topk(h_dense.abs().squeeze(0), k=5)
-        top_indices = top_indices.tolist()
 
         override_base = activations.unsqueeze(0)
 
@@ -410,50 +416,84 @@ def main() -> None:
             )
 
         rows = []
-        for latent_idx in top_indices:
-            direction = build_decoder_direction(sae, latent_idx)
+        for token_pos in range(seq_len):
+            h_token = activations[token_pos].to(device=device, dtype=sae_dtype).unsqueeze(0)
 
-            for sign in signs:
-                for alpha in alphas:
-                    h_new = h_token.squeeze(0) + (sign * alpha * direction)
+            with torch.no_grad():
+                h_dense, h_sparse = encode_with_sae(sae, h_token)
+                grounding_original = g_sae(h_sparse, c_vector).item()
 
-                    with torch.no_grad():
-                        h_dense_new, h_sparse_new = encode_with_sae(sae, h_new.unsqueeze(0))
-                        grounding_new = g_sae(h_sparse_new, c_vector).item()
+                _, top_indices = torch.topk(h_dense.abs().squeeze(0), k=5)
+                top_indices = top_indices.tolist()
 
-                    override_activations = activations.clone()
-                    override_activations[token_pos] = h_new.to(device=device, dtype=model_dtype)
-                    override_activations = override_activations.unsqueeze(0)
+                total_trials = 0
+                output_changed_count = 0
+                grounding_new_sum = 0.0
+                grounding_delta_sum = 0.0
+                max_grounding_delta = float("-inf")
+                min_grounding_delta = float("inf")
 
-                    with torch.no_grad():
-                        output_new = generate_with_activation_override(
-                            model=model,
-                            tokenizer=tokenizer,
-                            prompt_tokens=prompt_tokens,
-                            override_layer=args.layer,
-                            override_activations=override_activations,
-                            max_new_tokens=args.max_new_tokens,
-                            temperature=args.temperature,
-                            top_p=args.top_p,
-                        )
+                for latent_idx in top_indices:
+                    direction = build_decoder_direction(sae, latent_idx)
 
-                    result = PerturbationResult(
-                        sample_idx=sample_idx,
-                        activation_path=str(activation_path),
-                        token_pos=token_pos,
-                        latent_idx=int(latent_idx),
-                        sign=sign,
-                        alpha=float(alpha),
-                        grounding_original=float(grounding_original),
-                        grounding_new=float(grounding_new),
-                        output_original=output_original,
-                        output_new=output_new,
-                        output_changed=output_new != output_original,
-                    )
-                    rows.append(asdict(result))
+                    for sign in signs:
+                        for alpha in alphas:
+                            h_new = h_token.squeeze(0) + (sign * alpha * direction)
 
-        write_jsonl(args.output_jsonl, rows)
-        logging.info("Wrote %s rows for sample %s", len(rows), sample_idx)
+                            with torch.no_grad():
+                                _, h_sparse_new = encode_with_sae(sae, h_new.unsqueeze(0))
+                                grounding_new = g_sae(h_sparse_new, c_vector).item()
+
+                            override_activations = activations.clone()
+                            override_activations[token_pos] = h_new.to(device=device, dtype=model_dtype)
+                            override_activations = override_activations.unsqueeze(0)
+
+                            with torch.no_grad():
+                                output_new = generate_with_activation_override(
+                                    model=model,
+                                    tokenizer=tokenizer,
+                                    prompt_tokens=prompt_tokens,
+                                    override_layer=args.layer,
+                                    override_activations=override_activations,
+                                    max_new_tokens=args.max_new_tokens,
+                                    temperature=args.temperature,
+                                    top_p=args.top_p,
+                                )
+
+                            total_trials += 1
+                            grounding_new_sum += grounding_new
+                            delta = grounding_new - grounding_original
+                            grounding_delta_sum += delta
+                            max_grounding_delta = max(max_grounding_delta, delta)
+                            min_grounding_delta = min(min_grounding_delta, delta)
+
+                            if output_new != output_original:
+                                output_changed_count += 1
+
+                avg_grounding_new = grounding_new_sum / max(1, total_trials)
+                avg_grounding_delta = grounding_delta_sum / max(1, total_trials)
+                output_changed_ratio = output_changed_count / max(1, total_trials)
+
+                summary = TokenPerturbationSummary(
+                    sample_idx=sample_idx,
+                    activation_path=str(activation_path),
+                    token_pos=token_pos,
+                    seq_len=seq_len,
+                    prompt_len=len(prompt_tokens),
+                    top_latents=top_indices,
+                    grounding_original=float(grounding_original),
+                    avg_grounding_new=float(avg_grounding_new),
+                    avg_grounding_delta=float(avg_grounding_delta),
+                    max_grounding_delta=float(max_grounding_delta),
+                    min_grounding_delta=float(min_grounding_delta),
+                    total_trials=total_trials,
+                    output_changed_count=output_changed_count,
+                    output_changed_ratio=float(output_changed_ratio),
+                )
+                rows.append(asdict(summary))
+
+            write_jsonl(args.output_jsonl, rows)
+            logging.info("Wrote %s token summaries for sample %s", len(rows), sample_idx)
 
     logging.info("Done. Results written to %s", args.output_jsonl)
 
