@@ -198,6 +198,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--avg_latents_dir", type=Path, default=Path("sparse_activation_analysis"))
     parser.add_argument("--output_dir", type=Path, default=Path("results/sae_direction_perturb"))
     parser.add_argument("--output_jsonl", type=Path, default=None)
+    parser.add_argument("--output_full_jsonl", type=Path, default=None)
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=0.9)
@@ -266,6 +267,11 @@ def main() -> None:
         args.output_jsonl = args.output_dir / "results.jsonl"
     else:
         args.output_jsonl = args.output_jsonl.resolve()
+
+    if args.output_full_jsonl is None:
+        args.output_full_jsonl = args.output_dir / "results_full.jsonl"
+    else:
+        args.output_full_jsonl = args.output_full_jsonl.resolve()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_dtype = {
@@ -416,6 +422,7 @@ def main() -> None:
             )
 
         rows = []
+        full_rows = []
         for token_pos in range(seq_len):
             h_token = activations[token_pos].to(device=device, dtype=sae_dtype).unsqueeze(0)
 
@@ -467,8 +474,24 @@ def main() -> None:
                             max_grounding_delta = max(max_grounding_delta, delta)
                             min_grounding_delta = min(min_grounding_delta, delta)
 
-                            if output_new != output_original:
+                            output_changed = output_new != output_original
+                            if output_changed:
                                 output_changed_count += 1
+
+                            full_result = PerturbationResult(
+                                sample_idx=sample_idx,
+                                activation_path=str(activation_path),
+                                token_pos=token_pos,
+                                latent_idx=int(latent_idx),
+                                sign=sign,
+                                alpha=float(alpha),
+                                grounding_original=float(grounding_original),
+                                grounding_new=float(grounding_new),
+                                output_original=output_original,
+                                output_new=output_new,
+                                output_changed=output_changed,
+                            )
+                            full_rows.append(asdict(full_result))
 
                 avg_grounding_new = grounding_new_sum / max(1, total_trials)
                 avg_grounding_delta = grounding_delta_sum / max(1, total_trials)
@@ -492,8 +515,14 @@ def main() -> None:
                 )
                 rows.append(asdict(summary))
 
-            write_jsonl(args.output_jsonl, rows)
-            logging.info("Wrote %s token summaries for sample %s", len(rows), sample_idx)
+        write_jsonl(args.output_jsonl, rows)
+        write_jsonl(args.output_full_jsonl, full_rows)
+        logging.info(
+            "Wrote %s token summaries and %s full rows for sample %s",
+            len(rows),
+            len(full_rows),
+            sample_idx,
+        )
 
     logging.info("Done. Results written to %s", args.output_jsonl)
 
