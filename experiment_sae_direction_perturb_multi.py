@@ -16,10 +16,7 @@ from utils.llama_3_model_download import MODEL_REGISTRY, ensure_model_downloaded
 
 from sae import load_sae_model
 from inference_activations import generate_with_activation_override
-
-
-def g_sae(z: torch.Tensor, c: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    return (c * z).sum(dim=-1) / (z.sum(dim=-1) + eps)
+from utils.grounding_scores import GroundingScoreCalculator
 
 
 @dataclass
@@ -315,19 +312,11 @@ def main() -> None:
         dtype=sae_dtype,
     )
 
-    arc_path = args.avg_latents_dir / "avg_latents_arc_easy.pt"
-    hle_path = args.avg_latents_dir / "avg_latents_hle.pt"
-
-    if not arc_path.exists() or not hle_path.exists():
-        raise FileNotFoundError("Missing avg latents; expected ARC-Easy and HLE tensors in avg_latents_dir")
-
-    arc = torch.load(arc_path, map_location="cpu", weights_only=True).to(device=device, dtype=sae_dtype)
-    hle = torch.load(hle_path, map_location="cpu", weights_only=True).to(device=device, dtype=sae_dtype)
-
-    if arc.shape != hle.shape:
-        raise ValueError(f"Shape mismatch: ARC-Easy {tuple(arc.shape)} vs HLE {tuple(hle.shape)}")
-
-    c_vector = arc - hle
+    grounding_calc = GroundingScoreCalculator.from_avg_latents(
+        avg_latents_dir=args.avg_latents_dir,
+        device=device,
+        dtype=sae_dtype,
+    )
 
     activation_indices = parse_activation_indices(args.activation_indices)
     if not activation_indices:
@@ -428,7 +417,7 @@ def main() -> None:
 
             with torch.no_grad():
                 h_dense, h_sparse = encode_with_sae(sae, h_token)
-                grounding_original = g_sae(h_sparse, c_vector).item()
+                grounding_original = grounding_calc.score(h_sparse).item()
 
                 _, top_indices = torch.topk(h_dense.abs().squeeze(0), k=5)
                 top_indices = top_indices.tolist()
@@ -449,7 +438,7 @@ def main() -> None:
 
                             with torch.no_grad():
                                 _, h_sparse_new = encode_with_sae(sae, h_new.unsqueeze(0))
-                                grounding_new = g_sae(h_sparse_new, c_vector).item()
+                                grounding_new = grounding_calc.score(h_sparse_new).item()
 
                             override_activations = activations.clone()
                             override_activations[token_pos] = h_new.to(device=device, dtype=model_dtype)
