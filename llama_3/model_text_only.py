@@ -383,5 +383,45 @@ class Transformer(nn.Module):
         output = self.output(h).float()
         return output
 
+    def forward_with_activation_override_grad(
+        self,
+        tokens: torch.Tensor,
+        start_pos: int,
+        override_layer: int,
+        override_activations: torch.Tensor,
+    ):
+        _bsz, seqlen = tokens.shape
+        h = self.tok_embeddings(tokens)
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
+            mask = torch.triu(mask, diagonal=1)
+            mask = torch.hstack(
+                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
+            ).type_as(h)
+
+        for layer_id, layer in enumerate(self.layers):
+            if layer_id == override_layer:
+                x_normalized = layer.attention_norm(h)
+                if override_activations.shape != x_normalized.shape:
+                    raise ValueError(
+                        "override_activations shape mismatch: "
+                        f"expected {tuple(x_normalized.shape)}, got {tuple(override_activations.shape)}"
+                    )
+                x_normalized = override_activations.to(x_normalized)
+                if layer.sae_forward_fn:
+                    x_normalized = layer.sae_forward_fn(x_normalized)
+                h = h + layer.attention(x_normalized, start_pos, freqs_cis, mask)
+                h = h + layer.feed_forward(layer.ffn_norm(h))
+            else:
+                h = layer(h, start_pos, freqs_cis, mask)
+
+        h = self.norm(h)
+        output = self.output(h).float()
+        return output
+
     def get_layer_residual_activs(self) -> dict[int, torch.Tensor]:
         return {layer_id: self.layers[layer_id].residual_activations.cpu() for layer_id in self.store_layer_activ}

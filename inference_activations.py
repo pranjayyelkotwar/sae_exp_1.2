@@ -196,6 +196,45 @@ def generate_with_activation_override(
     return tokenizer.decode(generated)
 
 
+@torch.inference_mode()
+def logits_with_activation_override(
+    model: Transformer,
+    prompt_tokens: list[int],
+    override_layer: int,
+    override_activations: torch.Tensor,
+    token_pos: int,
+) -> torch.Tensor:
+    if override_activations.dim() != 3:
+        raise ValueError(
+            "override_activations must have shape (batch, seq_len, d_model); "
+            f"got {tuple(override_activations.shape)}"
+        )
+
+    batch_size, seq_len, _ = override_activations.shape
+    if seq_len != len(prompt_tokens):
+        raise ValueError(
+            "prompt_tokens length must match override_activations seq_len; "
+            f"got tokens={len(prompt_tokens)} and seq_len={seq_len}"
+        )
+
+    if token_pos < 0:
+        token_pos = max(0, seq_len - 1)
+    else:
+        token_pos = min(token_pos, max(0, seq_len - 1))
+
+    device = next(model.parameters()).device
+    tokens = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
+    tokens = tokens.unsqueeze(0).repeat(batch_size, 1)
+
+    outputs = model.forward_with_activation_override(
+        tokens,
+        start_pos=0,
+        override_layer=override_layer,
+        override_activations=override_activations,
+    )
+    return outputs[:, token_pos, :]
+
+
 def parse_activation_idx(path: Path, expected_layer: int) -> int | None:
     match = ACTIVATION_FILENAME_RE.match(path.name)
     if not match:
