@@ -52,10 +52,15 @@ class SparseMutationSampler:
                     min_active,
                     max_active + 1,
                     (1,),
+                    device=device,
                     generator=self.generator,
                 ).item()
             )
-            perm = torch.randperm(len(active_latents), generator=self.generator)[:k].tolist()
+            perm = torch.randperm(
+                len(active_latents),
+                device=device,
+                generator=self.generator,
+            )[:k].tolist()
             latent_indices = [active_latents[i] for i in perm]
             coefficients = torch.randn(k, generator=self.generator, device=device, dtype=dtype) * sigma
 
