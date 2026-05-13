@@ -83,6 +83,17 @@ def compute_pseudo_curv(
         base_override_activations: Residual stream activations (batch, seq_len, d_model).
         token_pos: Sequence position to perturb; will be clamped to valid range.
         h_dense: SAE latent activations for the same token position (shape [1, d_latent]
+    max_batch = config.mc_samples
+    if hasattr(model, "params") and getattr(model.params, "max_batch_size", None):
+        max_batch = max(1, int(model.params.max_batch_size))
+    cache_limit = None
+    if hasattr(model, "layers") and model.layers:
+        try:
+            cache_limit = model.layers[0].attention.cache_k.shape[0]
+        except Exception:
+            cache_limit = None
+    if cache_limit is not None:
+        max_batch = min(max_batch, int(cache_limit))
             or [d_latent]). Used to pick top active latents.
         decoder_weight: SAE decoder matrix (d_model, d_latent); each column is a latent
             direction in residual space.
@@ -151,14 +162,31 @@ def compute_pseudo_curv(
     override_batch = base_override_activations.repeat(config.mc_samples, 1, 1)
     override_batch[:, token_pos, :] = override_batch[:, token_pos, :] + deltas
 
-    pert_logits = logits_with_activation_override(
-        model=model,
-        prompt_tokens=prompt_tokens,
-        override_layer=override_layer,
-        override_activations=override_batch,
-        token_pos=token_pos,
-    )
-    pert_logits = pert_logits.float()
+    max_batch = config.mc_samples
+    if hasattr(model, "params") and getattr(model.params, "max_batch_size", None):
+        max_batch = max(1, int(model.params.max_batch_size))
+    cache_limit = None
+    if hasattr(model, "layers") and model.layers:
+        try:
+            cache_limit = model.layers[0].attention.cache_k.shape[0]
+        except Exception:
+            cache_limit = None
+    if cache_limit is not None:
+        max_batch = min(max_batch, int(cache_limit))
+
+    pert_chunks = []
+    for start in range(0, config.mc_samples, max_batch):
+        chunk = override_batch[start : start + max_batch]
+        chunk_logits = logits_with_activation_override(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            override_layer=override_layer,
+            override_activations=chunk,
+            token_pos=token_pos,
+        )
+        pert_chunks.append(chunk_logits)
+
+    pert_logits = torch.cat(pert_chunks, dim=0).float()
 
     topk_idx = topk_idx.repeat(config.mc_samples, 1)
     pert_topk_logits = torch.gather(pert_logits, dim=-1, index=topk_idx)
