@@ -21,6 +21,7 @@ from evaluate_grounding_functions import (
 from experiment_sae_direction_perturb import write_jsonl
 from grounding_functions.curv import PseudoCurvConfig
 from grounding_functions.stability import StabilityConfig
+from inference_activations import generate_with_activation_override
 from llama_3.args import ModelArgs
 from llama_3.tokenizer import Tokenizer
 from sae import load_sae_model
@@ -54,6 +55,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--max_token_length", type=int, default=192)
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--max_batch_size", type=int, default=1)
+    parser.add_argument(
+        "--generate_output",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Generate text output before and after ISLD search.",
+    )
+    parser.add_argument("--output_temperature", type=float, default=0.0)
+    parser.add_argument("--output_top_p", type=float, default=0.9)
     parser.add_argument("--dataset_source", type=str, choices=["openwebtext", "qa"], default="qa")
     parser.add_argument(
         "--qa_datasets",
@@ -321,7 +330,33 @@ def main() -> None:
             },
         )
 
+        output_original = None
+        if args.generate_output:
+            output_original = generate_with_activation_override(
+                model=model,
+                tokenizer=tokenizer,
+                prompt_tokens=prompt_tokens,
+                override_layer=args.layer,
+                override_activations=override_activations,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.output_temperature,
+                top_p=args.output_top_p,
+            )
+
         final_state, history = search.run(state)
+
+        output_final = None
+        if args.generate_output:
+            output_final = generate_with_activation_override(
+                model=model,
+                tokenizer=tokenizer,
+                prompt_tokens=prompt_tokens,
+                override_layer=args.layer,
+                override_activations=final_state.override_activations,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.output_temperature,
+                top_p=args.output_top_p,
+            )
         rows = []
         for row in history.to_jsonl_rows():
             row.update(
@@ -333,6 +368,12 @@ def main() -> None:
                     "layer": args.layer,
                 }
             )
+            if args.generate_output:
+                if row.get("step") == 0 and output_original is not None:
+                    row["output_original"] = output_original
+                if row.get("step") == final_state.step and output_final is not None:
+                    row["output_final"] = output_final
+                    row["output_changed"] = output_original != output_final
             rows.append(row)
         write_jsonl(args.output_jsonl, rows)
 
