@@ -78,6 +78,8 @@ class ISLDEvolutionarySearch:
                 override_activations=state.override_activations,
                 token_pos=state.token_pos,
             )
+            fisher_diag_cpu = fisher_diag.detach().cpu()
+            del fisher_diag
 
             mutations = self.sampler.sample(
                 active_latents=active_latents,
@@ -105,7 +107,15 @@ class ISLDEvolutionarySearch:
                 h_dense_new, h_sparse_new = self._encode_hidden(hidden_state)
 
                 g_sae = self.evaluator.compute_sae(h_sparse_new)
-                g_stab = self.evaluator.compute_stability(mutation.delta, fisher_diag)
+                g_stab_value = self.evaluator.compute_stability(
+                    mutation.delta.detach().cpu(),
+                    fisher_diag_cpu,
+                ).item()
+                g_stab = torch.tensor(
+                    g_stab_value,
+                    device=g_sae.device,
+                    dtype=g_sae.dtype,
+                )
                 g_curv = self.evaluator.compute_curvature(
                     model=self.model,
                     prompt_tokens=state.prompt_tokens,
@@ -127,7 +137,7 @@ class ISLDEvolutionarySearch:
                     best_override = override_activations
                     best_components = {
                         "g_sae": float(g_sae.item()),
-                        "g_stab": float(g_stab.item()),
+                        "g_stab": float(g_stab_value),
                         "g_curv": float(g_curv.item()),
                     }
 
