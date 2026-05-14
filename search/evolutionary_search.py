@@ -50,7 +50,7 @@ class ISLDEvolutionarySearch:
                 step=state.step,
                 grounding_score=base_score,
                 active_latents=[],
-                hidden_state=state.hidden_state,
+                hidden_state=state.hidden_state.detach().cpu(),
                 mutation=None,
                 metadata={"stage": "init"},
             )
@@ -139,13 +139,20 @@ class ISLDEvolutionarySearch:
             state.override_activations = best_override
             state.grounding_score = float(best_score)
 
+            mutation_snapshot = SparseMutation(
+                latent_indices=best_mutation.latent_indices,
+                coefficients=best_mutation.coefficients.detach().cpu(),
+                delta=best_mutation.delta.detach().cpu(),
+                parent_score=best_mutation.parent_score,
+                child_score=best_mutation.child_score,
+            )
             history.add(
                 TrajectoryEvent(
                     step=state.step,
                     grounding_score=state.grounding_score,
                     active_latents=active_latents,
-                    hidden_state=best_hidden,
-                    mutation=best_mutation,
+                    hidden_state=best_hidden.detach().cpu(),
+                    mutation=mutation_snapshot,
                     metadata=best_components,
                 )
             )
