@@ -153,20 +153,25 @@ def load_sae_model(
     d_model = b_pre.shape[0]
     n_latents = state_dict["encoder.weight"].shape[0]
 
+    # Use float32 init on CPU to avoid orthogonal_ QR limitation for float16.
+    init_dtype = dtype
+    if dtype == torch.float16 and device.type == "cpu":
+        init_dtype = torch.float32
+
     logging.info("Initializing TopK SAE model and loading state dict...")
     model = TopKSparseAutoencoder(
         d_model=d_model,
         n_latents=n_latents,
         k=sae_top_k,
         b_pre=b_pre,
-        dtype=dtype,
+        dtype=init_dtype,
         normalize_eps=sae_normalization_eps,
     )
     model.load_state_dict(state_dict)
     del state_dict
 
     logging.info(f"Moving model to device {device} and setting to eval mode...")
-    model.to(device)
+    model.to(device=device, dtype=dtype)
     model.eval()
 
     return model
