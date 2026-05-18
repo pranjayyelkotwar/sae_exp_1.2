@@ -155,7 +155,7 @@ def load_sae_model(
 
     # Use float32 init on CPU to avoid orthogonal_ QR limitation for float16.
     init_dtype = dtype
-    if dtype == torch.float16 and device.type == "cpu":
+    if dtype == torch.float16:
         init_dtype = torch.float32
 
     logging.info("Initializing TopK SAE model and loading state dict...")
