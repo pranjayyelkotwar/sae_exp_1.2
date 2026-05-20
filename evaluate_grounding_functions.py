@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import statistics
 from pathlib import Path
 
 import torch
@@ -21,7 +22,29 @@ from grounding_functions.stability import StabilityConfig, compute_fisher_diag, 
 def parse_activation_indices(raw: str) -> list[int]:
     if not raw:
         return []
+    if raw.strip().lower() in {"all", "*"}:
+        return []
     return [int(idx.strip()) for idx in raw.split(",") if idx.strip()]
+
+
+def find_activation_indices(activation_dir: Path, layer: int) -> list[int]:
+    layer_dir = activation_dir / f"layer_{layer}"
+    if not layer_dir.exists():
+        raise FileNotFoundError(f"Activation layer directory not found: {layer_dir}")
+
+    indices: list[int] = []
+    prefix = f"activations_l{layer}_idx"
+    for path in layer_dir.glob(f"{prefix}*.pt"):
+        stem = path.stem
+        if not stem.startswith(prefix):
+            continue
+        raw_idx = stem[len(prefix) :]
+        try:
+            indices.append(int(raw_idx))
+        except ValueError:
+            continue
+
+    return sorted(indices)
 
 
 def load_model(
@@ -134,7 +157,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--sae_model_path", type=Path, required=True)
     parser.add_argument("--activation_dir", type=Path, default=Path("activation_outs"))
     parser.add_argument("--metadata_file", type=Path, default=Path("activation_outs/metadata_rank0.jsonl"))
-    parser.add_argument("--activation_indices", type=str, default="3")
+    parser.add_argument(
+        "--activation_indices",
+        type=str,
+        default="3",
+        help="Comma-separated indices, or 'all' to scan activation_dir/layer_{layer}.",
+    )
     parser.add_argument("--layer", type=int, default=22)
     parser.add_argument("--token_pos", type=int, default=-1)
     parser.add_argument("--avg_latents_dir", type=Path, default=Path("sparse_activation_analysis"))
@@ -260,7 +288,10 @@ def main() -> None:
 
     activation_indices = parse_activation_indices(args.activation_indices)
     if not activation_indices:
-        raise ValueError("No activation indices provided")
+        logging.info("No explicit indices provided; scanning activation directory...")
+        activation_indices = find_activation_indices(args.activation_dir, args.layer)
+    if not activation_indices:
+        raise ValueError("No activation indices found")
 
     prompt_map: dict[int, str] = {}
     if args.use_metadata_prompt:
@@ -268,6 +299,11 @@ def main() -> None:
         prompt_map = load_prompts_from_metadata(args.metadata_file, set(activation_indices))
 
     args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+
+    grounding_sae_values: list[float] = []
+    grounding_stab_values: list[float] = []
+    grounding_curv_values: list[float] = []
+    grounding_total_values: list[float] = []
 
     for sample_idx in activation_indices:
         activation_path = resolve_activation_path(args.activation_dir, args.layer, sample_idx)
@@ -358,6 +394,11 @@ def main() -> None:
             + args.weight_curv * grounding_curv
         )
 
+        grounding_sae_values.append(grounding_sae)
+        grounding_stab_values.append(grounding_stab)
+        grounding_curv_values.append(grounding_curv)
+        grounding_total_values.append(composite)
+
         record = {
             "sample_idx": sample_idx,
             "activation_path": str(activation_path),
@@ -384,6 +425,31 @@ def main() -> None:
             grounding_stab,
             grounding_curv,
             composite,
+        )
+
+    if grounding_total_values:
+        avg_total = statistics.mean(grounding_total_values)
+        median_total = statistics.median(grounding_total_values)
+
+        median_sae = statistics.median(grounding_sae_values)
+        median_stab = statistics.median(grounding_stab_values)
+        median_curv = statistics.median(grounding_curv_values)
+
+        def _safe_inv(value: float) -> float:
+            return 0.0 if value == 0 else 1.0 / abs(value)
+
+        suggested_weights = {
+            "weight_sae": _safe_inv(median_sae),
+            "weight_stab": _safe_inv(median_stab),
+            "weight_curv": _safe_inv(median_curv),
+        }
+
+        logging.info("G_total avg=%.6f, median=%.6f", avg_total, median_total)
+        logging.info(
+            "Suggested weights (inverse-median normalization): sae=%.6f, stab=%.6f, curv=%.6f",
+            suggested_weights["weight_sae"],
+            suggested_weights["weight_stab"],
+            suggested_weights["weight_curv"],
         )
 
 
