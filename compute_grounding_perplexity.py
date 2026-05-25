@@ -15,6 +15,7 @@ except ImportError:  # pragma: no cover
 from llama_3.args import ModelArgs
 from llama_3.model_text_only import Transformer
 from llama_3.tokenizer import Tokenizer
+from utils.cuda_utils import set_up_cuda
 from utils.llama_3_model_download import MODEL_REGISTRY, ensure_model_downloaded
 
 
@@ -55,6 +56,12 @@ def parse_arguments() -> argparse.Namespace:
         type=int,
         default=None,
         help="Override model max_batch_size (defaults to batch_size).",
+    )
+    parser.add_argument(
+        "--seq_chunk_size",
+        type=int,
+        default=64,
+        help="Chunk length for logits to reduce VRAM (set to max_token_length for full chunk).",
     )
     parser.add_argument("--max_token_length", type=int, default=192)
     parser.add_argument(
@@ -254,6 +261,7 @@ def compute_perplexity(
     pad_id: int,
     device: torch.device,
     batch_size: int,
+    seq_chunk_size: int,
 ) -> dict[int, dict[str, float]]:
     results: dict[int, dict[str, float]] = {}
 
@@ -280,19 +288,40 @@ def compute_perplexity(
                 )
 
         with torch.inference_mode():
-            logits = model(input_ids, start_pos=0)
-            log_probs = torch.log_softmax(logits, dim=-1)
+            sum_nll = torch.zeros(len(batch), device=device)
+            denom = torch.zeros(len(batch), device=device)
 
-            shifted_log_probs = log_probs[:, :-1, :]
-            shifted_labels = input_ids[:, 1:]
-            token_nll = -shifted_log_probs.gather(-1, shifted_labels.unsqueeze(-1)).squeeze(-1)
+            start_pos = 0
+            while start_pos < max_len:
+                end_pos = min(start_pos + seq_chunk_size, max_len)
+                chunk_len = end_pos - start_pos
+                if chunk_len <= 0:
+                    break
 
-            positions = torch.arange(max_len - 1, device=device).unsqueeze(0)
-            valid_mask = positions < (lengths - 1).unsqueeze(1)
-            token_nll = token_nll * valid_mask
+                token_chunk = input_ids[:, start_pos:end_pos]
+                logits = model(token_chunk, start_pos=start_pos)
 
-            sum_nll = token_nll.sum(dim=1)
-            denom = valid_mask.sum(dim=1)
+                max_label_len = min(chunk_len, max_len - start_pos - 1)
+                if max_label_len <= 0:
+                    start_pos = end_pos
+                    continue
+
+                logits = logits[:, :max_label_len, :]
+                labels = input_ids[:, start_pos + 1 : start_pos + 1 + max_label_len]
+
+                logsumexp = torch.logsumexp(logits, dim=-1)
+                target_logits = logits.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+                token_nll = logsumexp - target_logits
+
+                positions = torch.arange(max_label_len, device=device).unsqueeze(0)
+                valid_mask = positions < (lengths - 1 - start_pos).unsqueeze(1)
+                token_nll = token_nll * valid_mask
+
+                sum_nll += token_nll.sum(dim=1)
+                denom += valid_mask.sum(dim=1)
+
+                start_pos = end_pos
+
             denom_safe = denom.clamp(min=1)
             mean_nll = sum_nll / denom_safe
             mean_nll = torch.where(
@@ -347,6 +376,9 @@ def main() -> None:
     device = torch.device(args.device)
     dtype = parse_dtype(args.model_dtype)
 
+    if device.type == "cuda":
+        set_up_cuda()
+
     tokenizer_path = args.model_dir / "tokenizer.model"
     params_path = args.model_dir / "params.json"
     model_path = args.model_dir / "consolidated.00.pth"
@@ -400,6 +432,7 @@ def main() -> None:
         pad_id=tokenizer.pad_id,
         device=device,
         batch_size=args.batch_size,
+        seq_chunk_size=args.seq_chunk_size,
     )
 
     args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
