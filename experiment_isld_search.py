@@ -20,6 +20,7 @@ from evaluate_grounding_functions import (
 )
 from experiment_sae_direction_perturb import write_jsonl
 from grounding_functions.curv import PseudoCurvConfig
+from grounding_functions.perplexity_regression import load_perplexity_regression_weights
 from grounding_functions.stability import StabilityConfig
 from inference_activations import generate_with_activation_override
 from llama_3.args import ModelArgs
@@ -114,6 +115,19 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--weight_sae", type=float, default=1.0)
     parser.add_argument("--weight_stab", type=float, default=1.0)
     parser.add_argument("--weight_curv", type=float, default=1.0)
+    parser.add_argument("--weight_reg", type=float, default=0.0)
+    parser.add_argument(
+        "--perplexity_weights_path",
+        type=Path,
+        default=None,
+        help="Optional regression weights for perplexity-grounding.",
+    )
+    parser.add_argument(
+        "--use_regression_grounding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use regression grounding as the primary score (sets weight_sae=0, weight_reg=1).",
+    )
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
@@ -139,6 +153,8 @@ def main() -> None:
     args.activation_dir = args.activation_dir.resolve()
     args.metadata_file = args.metadata_file.resolve()
     args.output_jsonl = args.output_jsonl.resolve()
+    if args.perplexity_weights_path is not None:
+        args.perplexity_weights_path = args.perplexity_weights_path.resolve()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_dtype = {
@@ -188,12 +204,30 @@ def main() -> None:
         dtype=sae_dtype,
     )
 
+    regression_weights = None
+    if args.perplexity_weights_path is not None:
+        logging.info("Loading regression weights from %s", args.perplexity_weights_path)
+        regression_weights = load_perplexity_regression_weights(
+            args.perplexity_weights_path,
+            device=device,
+            dtype=torch.float32,
+        )
+
+    if args.use_regression_grounding:
+        if regression_weights is None:
+            raise ValueError("--use_regression_grounding requires --perplexity_weights_path")
+        args.weight_sae = 0.0
+        if args.weight_reg == 0.0:
+            args.weight_reg = 1.0
+
     evaluator = GroundingEvaluator(
         grounding_calc=grounding_calc,
+        regression_weights=regression_weights,
         weights=GroundingWeights(
             sae=args.weight_sae,
             stability=args.weight_stab,
             curvature=args.weight_curv,
+            regression=args.weight_reg,
         ),
         stability_config=StabilityConfig(topk=args.stab_topk),
         curv_config=PseudoCurvConfig(
@@ -293,6 +327,7 @@ def main() -> None:
 
         h_dense, h_sparse = sae.forward_1d_normalized(hidden_state.unsqueeze(0))[-2:]
         g_sae = evaluator.compute_sae(h_sparse)
+        g_reg = evaluator.compute_regression(h_sparse)
         g_stab = evaluator.compute_stability(
             delta=torch.zeros_like(hidden_state),
             fisher_diag=evaluator.compute_fisher_diag(
@@ -312,7 +347,7 @@ def main() -> None:
             h_dense=h_dense,
             decoder_weight=sae.decoder.weight,
         )
-        base_score = evaluator.total(g_sae, g_stab, g_curv).item()
+        base_score = evaluator.total(g_sae, g_stab, g_curv, g_reg).item()
 
         state = SearchState(
             prompt_tokens=prompt_tokens,

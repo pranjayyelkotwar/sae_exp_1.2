@@ -107,6 +107,7 @@ class ISLDEvolutionarySearch:
                 h_dense_new, h_sparse_new = self._encode_hidden(hidden_state)
 
                 g_sae = self.evaluator.compute_sae(h_sparse_new)
+                g_reg = self.evaluator.compute_regression(h_sparse_new)
                 g_stab_value = self.evaluator.compute_stability(
                     mutation.delta.detach().cpu(),
                     fisher_diag_cpu,
@@ -125,7 +126,7 @@ class ISLDEvolutionarySearch:
                     h_dense=h_dense_new,
                     decoder_weight=self.sae.decoder.weight,
                 )
-                total = self.evaluator.total(g_sae, g_stab, g_curv)
+                total = self.evaluator.total(g_sae, g_stab, g_curv, g_reg)
 
                 mutation.parent_score = base_score
                 mutation.child_score = float(total.item())
@@ -140,6 +141,8 @@ class ISLDEvolutionarySearch:
                         "g_stab": float(g_stab_value),
                         "g_curv": float(g_curv.item()),
                     }
+                    if g_reg is not None:
+                        best_components["g_reg"] = float(g_reg.item())
 
             if best_mutation is None or best_hidden is None or best_override is None:
                 break

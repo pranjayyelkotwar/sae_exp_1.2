@@ -1,0 +1,47 @@
+#!/bin/bash
+
+BETAS=(0.5 1 2 5 10)
+ACTIVATIONS=(4451 4454 4549)
+
+for ACT in "${ACTIVATIONS[@]}"; do
+    for BETA in "${BETAS[@]}"; do
+
+        echo "Running activation=${ACT}, beta=${BETA}"
+
+        python experiment_isld_search.py \
+            --model_name llama-3.1-8B \
+            --sae_model_path weights/sae_10epoch_weight.pt \
+            --perplexity_weights_path results/perplexity_regression_weights.pt \
+            --use_regression_grounding \
+            --weight_reg 1.0 \
+            --weight_stab 0.0 \
+            --weight_curv 0.0 \
+            --activation_indices ${ACT} \
+            --max_iters 50 \
+            --min_improvement 1e-4 \
+            --patience 5 \
+            --stab_topk 8 \
+            --curv_mc_samples 1 \
+            --max_token_length 128 \
+            --num_candidates 32 \
+            --beta ${BETA} \
+            --min_active 2 \
+            --max_active 6 \
+            --active_topk 16 \
+            --generate_output \
+            --max_new_tokens 64 \
+            --output_temperature 0.0 \
+            --output_top_p 0.9 \
+            --output_jsonl results/isld_search_act_${ACT}_beta_${BETA}.jsonl \
+            --model_dtype float16 \
+            --sae_dtype float16
+
+        echo "Finished activation=${ACT}, beta=${BETA}"
+
+        # Helps avoid VRAM fragmentation/leaks between runs
+        sleep 5
+
+    done
+done
+
+echo "All runs completed."

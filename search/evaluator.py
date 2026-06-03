@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 
 from grounding_functions.curv import PseudoCurvConfig, compute_pseudo_curv
+from grounding_functions.perplexity_regression import PerplexityRegressionWeights
 from grounding_functions.stability import StabilityConfig, compute_fisher_diag, score_stability_delta
 from utils.grounding_scores import GroundingScoreCalculator
 
@@ -14,17 +15,20 @@ class GroundingWeights:
     sae: float = 1.0
     stability: float = 1.0
     curvature: float = 1.0
+    regression: float = 0.0
 
 
 class GroundingEvaluator:
     def __init__(
         self,
         grounding_calc: GroundingScoreCalculator,
+        regression_weights: PerplexityRegressionWeights | None = None,
         weights: GroundingWeights | None = None,
         stability_config: StabilityConfig | None = None,
         curv_config: PseudoCurvConfig | None = None,
     ) -> None:
         self.grounding_calc = grounding_calc
+        self.regression_weights = regression_weights
         self.weights = weights or GroundingWeights()
         self.stability_config = stability_config or StabilityConfig()
         self.curv_config = curv_config or PseudoCurvConfig()
@@ -38,6 +42,11 @@ class GroundingEvaluator:
         fisher_diag: torch.Tensor,
     ) -> torch.Tensor:
         return score_stability_delta(delta, fisher_diag)
+
+    def compute_regression(self, h_sparse: torch.Tensor) -> torch.Tensor | None:
+        if self.regression_weights is None:
+            return None
+        return self.regression_weights.predict(h_sparse)
 
     def compute_fisher_diag(
         self,
@@ -82,9 +91,13 @@ class GroundingEvaluator:
         g_sae: torch.Tensor,
         g_stab: torch.Tensor,
         g_curv: torch.Tensor,
+        g_reg: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return (
+        total = (
             self.weights.sae * g_sae
             + self.weights.stability * g_stab
             + self.weights.curvature * g_curv
         )
+        if g_reg is not None:
+            total = total + (self.weights.regression * g_reg)
+        return total
