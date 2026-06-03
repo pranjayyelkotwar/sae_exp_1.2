@@ -238,6 +238,9 @@ def main() -> None:
         ),
     )
 
+    need_stability = evaluator.weights.stability != 0.0
+    need_curv = evaluator.weights.curvature != 0.0
+
     generator = torch.Generator(device=device)
     if args.seed is not None:
         generator.manual_seed(args.seed)
@@ -325,28 +328,41 @@ def main() -> None:
         hidden_state = activations[token_pos].to(device=device, dtype=sae_dtype)
         override_activations = activations.unsqueeze(0)
 
-        h_dense, h_sparse = sae.forward_1d_normalized(hidden_state.unsqueeze(0))[-2:]
-        g_sae = evaluator.compute_sae(h_sparse)
-        g_reg = evaluator.compute_regression(h_sparse)
-        g_stab = evaluator.compute_stability(
-            delta=torch.zeros_like(hidden_state),
-            fisher_diag=evaluator.compute_fisher_diag(
+        with torch.no_grad():
+            h_dense, h_sparse = sae.forward_1d_normalized(hidden_state.unsqueeze(0))[-2:]
+            g_sae = evaluator.compute_sae(h_sparse)
+            g_reg = evaluator.compute_regression(h_sparse)
+
+        if need_stability:
+            fisher_diag = evaluator.compute_fisher_diag(
                 model=model,
                 prompt_tokens=prompt_tokens,
                 override_layer=args.layer,
                 override_activations=override_activations,
                 token_pos=token_pos,
-            ),
-        )
-        g_curv = evaluator.compute_curvature(
-            model=model,
-            prompt_tokens=prompt_tokens,
-            override_layer=args.layer,
-            override_activations=override_activations,
-            token_pos=token_pos,
-            h_dense=h_dense,
-            decoder_weight=sae.decoder.weight,
-        )
+            )
+            g_stab = evaluator.compute_stability(
+                delta=torch.zeros_like(hidden_state),
+                fisher_diag=fisher_diag,
+            )
+            del fisher_diag
+        else:
+            g_stab = torch.tensor(0.0, device=g_sae.device, dtype=g_sae.dtype)
+
+        if need_curv:
+            with torch.no_grad():
+                g_curv = evaluator.compute_curvature(
+                    model=model,
+                    prompt_tokens=prompt_tokens,
+                    override_layer=args.layer,
+                    override_activations=override_activations,
+                    token_pos=token_pos,
+                    h_dense=h_dense,
+                    decoder_weight=sae.decoder.weight,
+                )
+        else:
+            g_curv = torch.tensor(0.0, device=g_sae.device, dtype=g_sae.dtype)
+
         base_score = evaluator.total(g_sae, g_stab, g_curv, g_reg).item()
 
         state = SearchState(
@@ -411,6 +427,9 @@ def main() -> None:
                     row["output_changed"] = output_original != output_final
             rows.append(row)
         write_jsonl(args.output_jsonl, rows)
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     logging.info("Done. Results written to %s", args.output_jsonl)
 

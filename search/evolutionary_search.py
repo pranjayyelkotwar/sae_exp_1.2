@@ -43,6 +43,9 @@ class ISLDEvolutionarySearch:
     def run(self, state: SearchState) -> tuple[SearchState, TrajectoryHistory]:
         history = TrajectoryHistory(trajectory_id=state.trajectory_id)
 
+        need_stability = self.evaluator.weights.stability != 0.0
+        need_curv = self.evaluator.weights.curvature != 0.0
+
         base_score = state.grounding_score
         stop_state = StoppingState(best_score=base_score)
         history.add(
@@ -71,15 +74,17 @@ class ISLDEvolutionarySearch:
             if not active_latents:
                 break
 
-            fisher_diag = self.evaluator.compute_fisher_diag(
-                model=self.model,
-                prompt_tokens=state.prompt_tokens,
-                override_layer=state.override_layer,
-                override_activations=state.override_activations,
-                token_pos=state.token_pos,
-            )
-            fisher_diag_cpu = fisher_diag.detach().cpu()
-            del fisher_diag
+            fisher_diag_cpu = None
+            if need_stability:
+                fisher_diag = self.evaluator.compute_fisher_diag(
+                    model=self.model,
+                    prompt_tokens=state.prompt_tokens,
+                    override_layer=state.override_layer,
+                    override_activations=state.override_activations,
+                    token_pos=state.token_pos,
+                )
+                fisher_diag_cpu = fisher_diag.detach().cpu()
+                del fisher_diag
 
             mutations = self.sampler.sample(
                 active_latents=active_latents,
@@ -108,24 +113,30 @@ class ISLDEvolutionarySearch:
 
                 g_sae = self.evaluator.compute_sae(h_sparse_new)
                 g_reg = self.evaluator.compute_regression(h_sparse_new)
-                g_stab_value = self.evaluator.compute_stability(
-                    mutation.delta.detach().cpu(),
-                    fisher_diag_cpu,
-                ).item()
+                g_stab_value = 0.0
+                if need_stability and fisher_diag_cpu is not None:
+                    g_stab_value = self.evaluator.compute_stability(
+                        mutation.delta.detach().cpu(),
+                        fisher_diag_cpu,
+                    ).item()
                 g_stab = torch.tensor(
                     g_stab_value,
                     device=g_sae.device,
                     dtype=g_sae.dtype,
                 )
-                g_curv = self.evaluator.compute_curvature(
-                    model=self.model,
-                    prompt_tokens=state.prompt_tokens,
-                    override_layer=state.override_layer,
-                    override_activations=override_activations,
-                    token_pos=state.token_pos,
-                    h_dense=h_dense_new,
-                    decoder_weight=self.sae.decoder.weight,
-                )
+                if need_curv:
+                    with torch.no_grad():
+                        g_curv = self.evaluator.compute_curvature(
+                            model=self.model,
+                            prompt_tokens=state.prompt_tokens,
+                            override_layer=state.override_layer,
+                            override_activations=override_activations,
+                            token_pos=state.token_pos,
+                            h_dense=h_dense_new,
+                            decoder_weight=self.sae.decoder.weight,
+                        )
+                else:
+                    g_curv = torch.tensor(0.0, device=g_sae.device, dtype=g_sae.dtype)
                 total = self.evaluator.total(g_sae, g_stab, g_curv, g_reg)
 
                 mutation.parent_score = base_score
@@ -179,7 +190,8 @@ class ISLDEvolutionarySearch:
         return state, history
 
     def _encode_hidden(self, h_token: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        _, h_dense, h_sparse = self.sae.forward_1d_normalized(h_token.unsqueeze(0))
+        with torch.no_grad():
+            _, h_dense, h_sparse = self.sae.forward_1d_normalized(h_token.unsqueeze(0))
         return h_dense, h_sparse
 
     def _select_active_latents(self, h_dense: torch.Tensor) -> list[int]:
