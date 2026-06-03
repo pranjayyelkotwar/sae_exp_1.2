@@ -16,6 +16,7 @@ from utils.llama_3_model_download import MODEL_REGISTRY, ensure_model_downloaded
 from sae import load_sae_model
 from utils.grounding_scores import GroundingScoreCalculator
 from grounding_functions.curv import PseudoCurvConfig, compute_pseudo_curv
+from grounding_functions.perplexity_regression import load_perplexity_regression_weights
 from grounding_functions.stability import StabilityConfig, compute_fisher_diag, score_stability_delta
 
 
@@ -213,6 +214,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--weight_sae", type=float, default=1.0)
     parser.add_argument("--weight_stab", type=float, default=1.0)
     parser.add_argument("--weight_curv", type=float, default=1.0)
+    parser.add_argument(
+        "--perplexity_weights_path",
+        type=Path,
+        default=None,
+        help="Optional regression weights to score SAE latents against perplexity.",
+    )
     return parser.parse_args()
 
 
@@ -237,6 +244,8 @@ def main() -> None:
     args.activation_dir = args.activation_dir.resolve()
     args.metadata_file = args.metadata_file.resolve()
     args.output_jsonl = args.output_jsonl.resolve()
+    if args.perplexity_weights_path is not None:
+        args.perplexity_weights_path = args.perplexity_weights_path.resolve()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_dtype = {
@@ -280,6 +289,15 @@ def main() -> None:
         dtype=sae_dtype,
     )
 
+    regression_weights = None
+    if args.perplexity_weights_path is not None:
+        logging.info("Loading regression weights from %s", args.perplexity_weights_path)
+        regression_weights = load_perplexity_regression_weights(
+            args.perplexity_weights_path,
+            device=device,
+            dtype=torch.float32,
+        )
+
     grounding_calc = GroundingScoreCalculator.from_avg_latents(
         avg_latents_dir=args.avg_latents_dir,
         device=device,
@@ -304,6 +322,7 @@ def main() -> None:
     grounding_stab_values: list[float] = []
     grounding_curv_values: list[float] = []
     grounding_total_values: list[float] = []
+    grounding_reg_values: list[float] = []
 
     for sample_idx in activation_indices:
         activation_path = resolve_activation_path(args.activation_dir, args.layer, sample_idx)
@@ -355,6 +374,10 @@ def main() -> None:
             _, h_dense, h_sparse = sae.forward_1d_normalized(h_token)
             grounding_sae = grounding_calc.score(h_sparse).item()
 
+        grounding_reg = None
+        if regression_weights is not None:
+            grounding_reg = regression_weights.predict(h_sparse).item()
+
         stability_cfg = StabilityConfig(topk=args.stab_topk)
         fisher_diag = compute_fisher_diag(
             model=model,
@@ -398,6 +421,8 @@ def main() -> None:
         grounding_stab_values.append(grounding_stab)
         grounding_curv_values.append(grounding_curv)
         grounding_total_values.append(composite)
+        if grounding_reg is not None:
+            grounding_reg_values.append(grounding_reg)
 
         record = {
             "sample_idx": sample_idx,
@@ -414,18 +439,32 @@ def main() -> None:
             "curv_beta": args.curv_beta,
             "curv_latent_topk": args.curv_latent_topk,
         }
+        if grounding_reg is not None and regression_weights is not None:
+            record["grounding_regression"] = grounding_reg
+            record["regression_target"] = regression_weights.target_key
 
         with args.output_jsonl.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
 
-        logging.info(
-            "Idx %s: G_sae=%.4f, G_stab=%.4f, G_curv=%.4f, G_total=%.4f",
-            sample_idx,
-            grounding_sae,
-            grounding_stab,
-            grounding_curv,
-            composite,
-        )
+        if grounding_reg is None:
+            logging.info(
+                "Idx %s: G_sae=%.4f, G_stab=%.4f, G_curv=%.4f, G_total=%.4f",
+                sample_idx,
+                grounding_sae,
+                grounding_stab,
+                grounding_curv,
+                composite,
+            )
+        else:
+            logging.info(
+                "Idx %s: G_sae=%.4f, G_stab=%.4f, G_curv=%.4f, G_reg=%.4f, G_total=%.4f",
+                sample_idx,
+                grounding_sae,
+                grounding_stab,
+                grounding_curv,
+                grounding_reg,
+                composite,
+            )
 
     if grounding_total_values:
         avg_total = statistics.mean(grounding_total_values)
@@ -451,6 +490,11 @@ def main() -> None:
             suggested_weights["weight_stab"],
             suggested_weights["weight_curv"],
         )
+
+    if grounding_reg_values:
+        avg_reg = statistics.mean(grounding_reg_values)
+        median_reg = statistics.median(grounding_reg_values)
+        logging.info("G_reg avg=%.6f, median=%.6f", avg_reg, median_reg)
 
 
 if __name__ == "__main__":
