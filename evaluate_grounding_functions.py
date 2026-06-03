@@ -6,6 +6,11 @@ from pathlib import Path
 
 import torch
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None
+
 from llama_3.args import ModelArgs
 from llama_3.model_text_only import Transformer
 from llama_3.tokenizer import Tokenizer
@@ -324,7 +329,11 @@ def main() -> None:
     grounding_total_values: list[float] = []
     grounding_reg_values: list[float] = []
 
-    for sample_idx in activation_indices:
+    index_iter = activation_indices
+    if tqdm is not None:
+        index_iter = tqdm(activation_indices, desc="Grounding eval")
+
+    for sample_idx in index_iter:
         activation_path = resolve_activation_path(args.activation_dir, args.layer, sample_idx)
         if not activation_path.exists():
             logging.warning("Activation file not found for idx %s: %s", sample_idx, activation_path)
