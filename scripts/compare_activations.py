@@ -11,6 +11,10 @@ import argparse
 import json
 from pathlib import Path
 from typing import List, Dict, Any
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import torch
