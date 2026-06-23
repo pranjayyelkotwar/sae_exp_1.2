@@ -10,9 +10,8 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 import sys
-from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
@@ -23,6 +22,7 @@ import torch
 from capture_activations import load_model
 from llama_3.tokenizer import Tokenizer
 from llama_3.args import ModelArgs
+from utils.llama_3_model_download import MODEL_REGISTRY, ensure_model_downloaded
 
 
 def read_paraphrases(path: Path) -> List[Dict[str, Any]]:
@@ -159,7 +159,8 @@ def rank_matches(pooled_vec: np.ndarray, candidates: List[Dict[str, Any]], top_k
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dir", type=Path, required=True)
+    parser.add_argument("--model_dir", type=Path, default=None)
+    parser.add_argument("--model_name", type=str, choices=sorted(MODEL_REGISTRY.keys()), default=None)
     parser.add_argument("--paraphrases", type=Path, default=Path("reverse_gen_exp/paraphrases.jsonl"))
     parser.add_argument("--results_dir", type=Path, default=Path("evolutionary_search_with_better_gf/results5"))
     parser.add_argument("--out_dir", type=Path, default=Path("activation_outs/paraphrases"))
@@ -167,6 +168,16 @@ def main():
     parser.add_argument("--top_k", type=int, default=10)
     parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
+
+    if args.model_dir is None and args.model_name is None:
+        raise ValueError("Either --model_dir or --model_name must be provided")
+    if args.model_dir is not None and args.model_name is not None:
+        raise ValueError("Provide only one of --model_dir or --model_name")
+
+    if args.model_name is not None:
+        args.model_dir = ensure_model_downloaded(args.model_name)
+    else:
+        args.model_dir = args.model_dir.resolve()
 
     tokenizer_path = args.model_dir / "tokenizer.model"
     params_path = args.model_dir / "params.json"
