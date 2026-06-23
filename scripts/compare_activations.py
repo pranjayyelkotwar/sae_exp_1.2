@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import heapq
 from pathlib import Path
 from typing import Any, Dict, List
 import sys
@@ -47,6 +48,7 @@ def capture_text_activations(
     layer: int,
     device: torch.device,
     out_dir: Path,
+    save_full_activations: bool,
 ) -> List[Dict[str, Any]]:
     """Run texts through the model and save pooled layer activations.
 
@@ -76,22 +78,23 @@ def capture_text_activations(
         if layer not in activs:
             raise KeyError(f"Layer {layer} not captured by model (store_layer_activ).")
         # activs[layer] -> tensor shape (bsz, seqlen, dim)
-        activ = activs[layer].cpu()
+        activ = activs[layer]
 
         # pooled representation: mean over sequence tokens
-        pooled = activ.mean(dim=1).squeeze(0).numpy()
+        pooled = activ.mean(dim=1).squeeze(0).cpu().numpy()
 
         pooled_path = layer_dir / f"pooled_paraphrase_{i}.npy"
-        full_path = layer_dir / f"activations_paraphrase_{i}.pt"
         np.save(pooled_path, pooled)
-        torch.save(activ, full_path)
 
         meta = {
             "idx": i,
             "text": text,
             "pooled_path": str(pooled_path),
-            "activations_path": str(full_path),
         }
+        if save_full_activations:
+            full_path = layer_dir / f"activations_paraphrase_{i}.pt"
+            torch.save(activ.cpu(), full_path)
+            meta["activations_path"] = str(full_path)
         meta_records.append(meta)
 
     # write metadata jsonl
@@ -135,26 +138,64 @@ def load_search_vectors(results_dir: Path) -> List[Dict[str, Any]]:
     return entries
 
 
-def rank_matches(pooled_vec: np.ndarray, candidates: List[Dict[str, Any]], top_k: int = 10):
-    # compute L2 distances
-    dists = []
-    for c in candidates:
+def iter_search_vectors(results_dir: Path):
+    for p in sorted(results_dir.glob("*.jsonl")):
+        with p.open("r", encoding="utf-8") as f:
+            for li, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                vec = None
+                if "hidden_state" in rec:
+                    vec = rec["hidden_state"]
+                else:
+                    for _, v in rec.items():
+                        if isinstance(v, list) and len(v) > 0 and isinstance(v[0], (int, float)):
+                            vec = v
+                            break
+                if vec is None:
+                    continue
+                yield {
+                    "file": str(p),
+                    "line_idx": li,
+                    "vector": np.array(vec, dtype=np.float32),
+                    "record": rec,
+                }
+
+
+def top_k_matches_streaming(pooled_vec: np.ndarray, results_dir: Path, top_k: int = 10):
+    heap = []
+    for c in iter_search_vectors(results_dir):
         v = c["vector"]
-        # if shapes mismatch, try to reshape or skip
         if v.shape != pooled_vec.shape:
-            # try to handle if candidate is longer: mean-pool it
             if v.ndim == 2:
                 cv = v.mean(axis=0)
             else:
-                # reshape mismatch, skip
                 continue
         else:
             cv = v
         dist = float(np.linalg.norm(pooled_vec - cv))
-        dists.append((dist, c))
-    dists.sort(key=lambda x: x[0])
-    top = [ {"distance": d, "file": c["file"], "line_idx": c["line_idx"], "grounding_score": c["record"].get("grounding_score")} for d, c in dists[:top_k] ]
-    return top
+        item = (-dist, c)
+        if len(heap) < top_k:
+            heapq.heappush(heap, item)
+        else:
+            if dist < -heap[0][0]:
+                heapq.heapreplace(heap, item)
+    matches = []
+    for neg_dist, c in sorted(heap, key=lambda x: x[0], reverse=True):
+        matches.append(
+            {
+                "distance": float(-neg_dist),
+                "file": c["file"],
+                "line_idx": c["line_idx"],
+                "grounding_score": c["record"].get("grounding_score"),
+            }
+        )
+    return matches
 
 
 def main():
@@ -167,6 +208,7 @@ def main():
     parser.add_argument("--layer", type=int, default=22)
     parser.add_argument("--top_k", type=int, default=10)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--save_full_activations", action="store_true")
     args = parser.parse_args()
 
     if args.model_dir is None and args.model_name is None:
@@ -192,23 +234,34 @@ def main():
     device = torch.device(args.device)
 
     # load model (reusing capture_activations.load_model)
-    model = load_model(model_path=model_path, model_args=model_args, store_layer_activ=[args.layer], device=device, dtype=torch.bfloat16 if torch.cuda.is_available() and device.type.startswith("cuda") else torch.float32)
+    model = load_model(
+        model_path=model_path,
+        model_args=model_args,
+        store_layer_activ=[args.layer],
+        device=device,
+        dtype=torch.bfloat16,
+    )
 
     # read paraphrases
     paraphrase_records = read_paraphrases(args.paraphrases)
     texts = [r.get("text", "") for r in paraphrase_records]
 
-    meta = capture_text_activations(texts, tokenizer, model, args.layer, device, args.out_dir)
-
-    # load search vectors
-    candidates = load_search_vectors(args.results_dir)
+    meta = capture_text_activations(
+        texts,
+        tokenizer,
+        model,
+        args.layer,
+        device,
+        args.out_dir,
+        save_full_activations=args.save_full_activations,
+    )
 
     # compute and save rankings
     out_rank_path = args.out_dir / "paraphrase_matches.jsonl"
     with out_rank_path.open("w", encoding="utf-8") as f:
         for m in meta:
             pooled = np.load(m["pooled_path"])
-            matches = rank_matches(pooled, candidates, top_k=args.top_k)
+            matches = top_k_matches_streaming(pooled, args.results_dir, top_k=args.top_k)
             out = {"idx": m["idx"], "text": m["text"], "matches": matches}
             f.write(json.dumps(out) + "\n")
 
