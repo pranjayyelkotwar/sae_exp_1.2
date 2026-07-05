@@ -172,6 +172,12 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
         help="Limit samples per QA dataset. Format: 'dataset_name:num,dataset_name:num' (e.g., 'mmlu:2200')",
     )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        choices=["float32", "float16", "bfloat16"],
+        default="float32",
+    )
     return parser.parse_args()
 
 
@@ -211,7 +217,12 @@ def main() -> None:
     store_layer_activ = [16,22]
     batch_size = 32
     dataloader_num_workers = 4
-    dtype = torch.bfloat16
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    dtype = dtype_map[args.dtype]
     max_token_length = 192
     add_bos_token = True # Setting this to true because our dataset has a start of sentence like structure
     dataset_shuffle = True
@@ -226,6 +237,7 @@ def main() -> None:
         logging.info(f"# dataset_source={args.dataset_source}")
         logging.info(f"# qa_datasets={args.qa_datasets}")
         logging.info(f"# qa_num_samples={args.qa_num_samples}")
+        logging.info(f"# dtype={args.dtype} ({dtype})")
         logging.info("#### Distributed Configuration:")
         logging.info(f"# world_size={world_size}")
         logging.info(f"# rank={rank}")
